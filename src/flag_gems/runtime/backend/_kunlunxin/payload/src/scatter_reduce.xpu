@@ -1,0 +1,77 @@
+// tle.raw payload (xpu3): O(N) 2D last-dim scatter_reduce.
+//
+// Each (core_num*cluster_num) thread owns a disjoint set of OUTPUT ROWS and
+// writes them completely -> no cross-thread contention, no partials/fold.
+// Per row the output is tiled into TB-column chunks held in LM; the row's
+// (index,src) are streamed through LM in KB blocks and reduced into the tile's
+// acc[]/cnt[].  cnt tracks #contributions (incl. self when include_self) and
+// drives mean + the include_self=False "untouched -> keep inp" rule.
+//
+// reduce codes: 0 sum, 1 prod, 2 mean, 3 amax, 4 amin (match _REDUCTIONS).
+// index is int32 (host casts torch.long -> int32; values < cols fit).
+//
+// Contract (lockstep with the Python stub):
+//   sr_reduce_f32(const float* inp, const int* index, const float* src,
+//                 float* out, int rows, int cols, int reduce, int include_self)
+#include "xpu/kernel/xtdk.h"
+
+#define TB 256
+#define KB 256
+#define POS_INF 3.402823466e38f
+#define NEG_INF -3.402823466e38f
+
+extern "C" __device__ void sr_reduce_f32(_global_ptr_ const float *inp,
+                                         _global_ptr_ const int *index,
+                                         _global_ptr_ const float *src,
+                                         _global_ptr_ float *out, int rows,
+                                         int cols, int reduce,
+                                         int include_self) {
+  int tid = core_id() * cluster_num() + cluster_id();
+  int nth = core_num() * cluster_num();
+
+  __local__ float acc[TB];
+  __local__ float linp[TB];
+  __local__ int cnt[TB];
+  __local__ int lidx[KB];
+  __local__ float lsrc[KB];
+
+  float ident = reduce == 1 ? 1.0f : (reduce == 3 ? NEG_INF : (reduce == 4 ? POS_INF : 0.0f));
+
+  for (int r = tid; r < rows; r += nth) {
+    long rbase = (long)r * cols;
+    for (int jt = 0; jt < cols; jt += TB) {
+      int tbn = cols - jt < TB ? cols - jt : TB;
+      GM2LM(inp + rbase + jt, linp, tbn * sizeof(float));
+      for (int j = 0; j < tbn; ++j) {
+        acc[j] = include_self ? linp[j] : ident;
+        cnt[j] = include_self ? 1 : 0;
+      }
+      for (int kb = 0; kb < cols; kb += KB) {
+        int kbn = cols - kb < KB ? cols - kb : KB;
+        GM2LM(index + rbase + kb, lidx, kbn * sizeof(int));
+        GM2LM(src + rbase + kb, lsrc, kbn * sizeof(float));
+        for (int i = 0; i < kbn; ++i) {
+          int j = lidx[i];
+          if (j >= jt && j < jt + tbn) {
+            int t = j - jt;
+            float v = lsrc[i];
+            if (reduce == 1) acc[t] = acc[t] * v;
+            else if (reduce == 3) acc[t] = acc[t] > v ? acc[t] : v;
+            else if (reduce == 4) acc[t] = acc[t] < v ? acc[t] : v;
+            else acc[t] = acc[t] + v;  // sum, mean
+            cnt[t] += 1;
+          }
+        }
+      }
+      for (int j = 0; j < tbn; ++j) {
+        if (cnt[j] == 0) {
+          acc[j] = linp[j];  // untouched (include_self=False) -> keep inp
+        } else if (reduce == 2) {
+          acc[j] = acc[j] / (float)cnt[j];  // mean
+        }
+      }
+      LM2GM(acc, out + rbase + jt, tbn * sizeof(float));
+    }
+  }
+  mfence();
+}
