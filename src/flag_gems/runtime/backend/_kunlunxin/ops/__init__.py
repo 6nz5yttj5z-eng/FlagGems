@@ -274,6 +274,8 @@ from .float_power_ import (  # noqa: F401  (registered via _FULL_CONFIG)
     float_power_tensor_tensor_,
     float_power_tensor_tensor_out,
 )
+from .fix import fix, fix_out
+from .fix_ import fix_
 from .floor import floor, floor_, floor_out
 from .fmax import fmax, fmax_out
 from .fmin import fmin, fmin_out
@@ -961,6 +963,9 @@ __all__ = [
     "fill_tensor",
     "fill_tensor_",
     "fill_tensor_out",
+    "fix",
+    "fix_",
+    "fix_out",
     "flash_attention_forward",
     "flash_attn_varlen_func",
     "flip",
