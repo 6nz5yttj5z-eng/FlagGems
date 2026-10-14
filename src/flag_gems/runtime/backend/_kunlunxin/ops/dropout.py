@@ -1,4 +1,5 @@
 import logging
+import os
 
 import torch
 import triton
@@ -10,6 +11,15 @@ from flag_gems.utils.random_utils import (
     philox_backend_seed_offset,
     uint_to_uniform_float,
 )
+
+try:  # hand-written-payload injection point (XPU cluster path)
+    import triton.experimental.tle as tle
+
+    _HAS_TLE = True
+except Exception:  # pragma: no cover - toolchain without tle.raw
+    tle = None
+    _HAS_TLE = False
+
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +173,70 @@ def dropout_backward_kernel(
 UNROLL = 8
 ROUNDS = 4
 
+_SIMD_CB = 1024
+_SIMD_MIN_N = 1024
+_SIMD_GRID_MIN = 32
+_SIMD_GRID_MAX = 512
+
+_PAYLOAD_OBJ = os.path.join(os.path.dirname(__file__), "..", "payload", "obj", "drop.o")
+
+if _HAS_TLE:
+    try:
+        _SIMD_DNS = ["N", "KEY", "THR", "SCALE", "VFP", "NP"]
+
+        @tle.raw.dialect("xpu3", object=_PAYLOAD_OBJ, arch=3)
+        def dr_f32(x, y, mb, n, key, thr, scale, vfp, PID, NPROG): ...
+
+        @tle.raw.dialect("xpu3", object=_PAYLOAD_OBJ, arch=3)
+        def dr_f16(x, y, mb, n, key, thr, scale, vfp, PID, NPROG): ...
+
+        @tle.raw.dialect("xpu3", object=_PAYLOAD_OBJ, arch=3)
+        def dr_bf16(x, y, mb, n, key, thr, scale, vfp, PID, NPROG): ...
+
+        @triton.jit(do_not_specialize=_SIMD_DNS)
+        def _dr_k_f32(X, Y, MB, N, KEY, THR, SCALE, VFP, NP):
+            tle.raw.call(
+                dr_f32, (X, Y, MB, N, KEY, THR, SCALE, VFP, tl.program_id(0), NP)
+            )
+
+        @triton.jit(do_not_specialize=_SIMD_DNS)
+        def _dr_k_f16(X, Y, MB, N, KEY, THR, SCALE, VFP, NP):
+            tle.raw.call(
+                dr_f16, (X, Y, MB, N, KEY, THR, SCALE, VFP, tl.program_id(0), NP)
+            )
+
+        @triton.jit(do_not_specialize=_SIMD_DNS)
+        def _dr_k_bf16(X, Y, MB, N, KEY, THR, SCALE, VFP, NP):
+            tle.raw.call(
+                dr_bf16, (X, Y, MB, N, KEY, THR, SCALE, VFP, tl.program_id(0), NP)
+            )
+
+        # bf16 cannot use bf16 SIMD arithmetic on this XPU3 part
+        # (`vvmul_bfloat16x32` raises an illegal instruction), so dr_bf16 does the
+        # whole computation on the fp32 bit pattern instead.
+        _SIMD_KERNELS = {
+            torch.float32: _dr_k_f32,
+            torch.float16: _dr_k_f16,
+            torch.bfloat16: _dr_k_bf16,
+        }
+    except Exception:  # pragma: no cover - toolchain without the tle.raw object channel
+        _SIMD_KERNELS = {}
+else:  # pragma: no cover
+    _SIMD_KERNELS = {}
+
+
+def _s32(v):
+    """Reinterpret a 32-bit value as a signed int32 (the payload takes i32)."""
+    v &= 0xFFFFFFFF
+    return v - 0x100000000 if v >= 0x80000000 else v
+
+
+def _simd_grid(n):
+    nwork = (n + _SIMD_CB - 1) // _SIMD_CB
+    g = (max(nwork, 1) + 63) // 64
+    g = max(_SIMD_GRID_MIN, min(_SIMD_GRID_MAX, g))
+    return (triton.next_power_of_2(g),)
+
 
 def _dropout_launch_config(N):
     if N <= 512:
@@ -198,9 +272,29 @@ def dropout(input, p, train=True):
     assert p > 0.0 and p < 1.0, "p must be in (0, 1)"
     device = input.device
     input = input.contiguous()
+    N = input.numel()
+    scale = 1.0 / (1.0 - p)
+    thr = _s32(int(p * 65536.0))
+
+    kernel = _SIMD_KERNELS.get(input.dtype)
+    if kernel is not None and _SIMD_MIN_N <= N <= 0x7FFFFFFF:
+        grid = _simd_grid(N)
+        out = torch.empty_like(input)
+        mask = torch.empty_like(input, dtype=torch.bool)
+        with torch_device_fn.device(device):
+            philox_seed, philox_offset = philox_backend_seed_offset(triton.cdiv(N, 2))
+            key = _s32(
+                int(philox_offset >> 32)
+                ^ (int(philox_seed) & 0xFFFFFFFF)
+                ^ ((int(philox_seed) >> 32) & 0xFFFFFFFF)
+            )
+            kernel[grid](
+                input, out, mask.view(torch.uint8), N, key, thr, scale, scale, grid[0]
+            )
+        return out, mask
+
     out = torch.empty_like(input)
     mask = torch.empty_like(input, dtype=torch.bool)
-    N = input.numel()
     BLOCK, num_warps = _dropout_launch_config(N)
     grid = (triton.cdiv(N, BLOCK * UNROLL),)
     increment = triton.cdiv(N, UNROLL)
